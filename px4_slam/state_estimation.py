@@ -1,4 +1,4 @@
-import time
+import uuid
 
 import gtsam
 import numpy as np
@@ -31,7 +31,7 @@ class StateEstimation(Node):
     def __init__(self):
         super().__init__("px4_slam")
 
-        self.declare_parameter("recording_id", str(int(time.time())))
+        self.declare_parameter("recording_id", str(uuid.uuid4()))
         recording_id = (
             self.get_parameter("recording_id").get_parameter_value().string_value
         )
@@ -196,18 +196,19 @@ class StateEstimation(Node):
         q = pose.rotation().toQuaternion()
         rr.set_time("keyframe", sequence=self.count)
         rr.log(
-            "world/state_estimate",
+            "world/state_estimate/position",
             rr.Transform3D(
                 translation=[t[0], t[1], t[2]],
                 rotation=rr.Quaternion(xyzw=[q.x(), q.y(), q.z(), q.w()]),
             ),
         )
-        rr.log("world/state_estimate/axes", rr.TransformAxes3D(axis_length=1.0), static=True)
+        rr.log("world/state_estimate/position/axes", rr.TransformAxes3D(axis_length=1.0))
         # accumulate and redraw the full path
         self.trajectory.append([t[0], t[1], t[2]])
         rr.log(
             "world/state_estimate/trajectory",
             rr.LineStrips3D([self.trajectory], colors=[[0, 200, 255]]),
+            static=True
         )
 
     def imu_callback(self, msg: SensorCombined):
