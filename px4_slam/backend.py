@@ -14,24 +14,6 @@ from sensor_msgs.msg import CameraInfo
 
 
 class Backend(Node):
-    pim: gtsam.PreintegratedImuMeasurements
-    biasKey: int
-    biasNoise: gtsam.noiseModel.Isotropic
-
-    latest_gps_msg: SensorGps | None = None
-    latest_mag_msg: VehicleMagnetometer | None = None
-
-    ref_sin_lat: float | None = None
-    ref_cos_lat: float | None = None
-    ref_lat: float | None = None
-    ref_lon: float | None = None
-    ref_alt: float | None = None
-
-    isam: gtsam.ISAM2
-
-    K: gtsam.Cal3_S2 | None = None
-    pixel_noise: gtsam.noiseModel.Isotropic
-    smart_params: gtsam.SmartProjectionParams
 
     initialized: bool = False
 
@@ -91,6 +73,21 @@ class Backend(Node):
         self._pose_pub = self.create_publisher(
             PoseStamped, "state_estimate/pose", qos_profile_sensor_data
         )
+
+        self.pim: gtsam.PreintegratedImuMeasurements
+        self.biasKey: int
+        self.biasNoise: gtsam.noiseModel.Isotropic
+        self.latest_gps_msg: SensorGps | None = None
+        self.latest_mag_msg: VehicleMagnetometer | None = None
+        self.ref_sin_lat: float | None = None
+        self.ref_cos_lat: float | None = None
+        self.ref_lat: float | None = None
+        self.ref_lon: float | None = None
+        self.ref_alt: float | None = None
+        self.isam: gtsam.ISAM2
+        self.K: gtsam.Cal3_S2 | None = None
+        self.pixel_noise: gtsam.noiseModel.Isotropic
+        self.smart_params: gtsam.SmartProjectionParams
 
         self.trajectory: list[list[float]] = []
 
@@ -463,7 +460,7 @@ class Backend(Node):
                 ))
 
     # ------------------------------------------------------------------
-    # visual-only reset — drops smart factors without touching the imu graph.
+    # visual-only reset - drops smart factors without touching the imu graph.
     # the pose variables remain valid so the imu graph keeps running cleanly.
     # ------------------------------------------------------------------
 
@@ -476,10 +473,8 @@ class Backend(Node):
             self.count,
         )
 
-    # ------------------------------------------------------------------
-    # loop closure
-    # ------------------------------------------------------------------
 
+    # loop closure
     def loop_closure_callback(self, msg: LoopClosure) -> None:
         curr_key = msg.current_keyframe_id
         loop_key = msg.loop_keyframe_id
