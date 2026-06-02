@@ -18,8 +18,8 @@ setup(
     zip_safe=True,
     maintainer="Graham Clifford",
     maintainer_email="gjcliff@gmail.com",
-    description="TODO: Package description",
-    license="TODO: License declaration",
+    description="estimating the state of things",
+    license="MIT",
     extras_require={
         "test": [
             "pytest",
