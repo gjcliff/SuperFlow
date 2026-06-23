@@ -53,14 +53,17 @@ executable = /usr/bin/env python3
 to the setup.cfg file
 
 ```bash
-cd ~/repos/ws/src/  
-git clone https://github.com/gjcliff/px4_slam.git
+cd ~/repos/ws/src/ &&
+    git clone https://github.com/gjcliff/px4_slam.git
 cd ~/repos/ws/
-python -m venv .venv --system-site-packges
+python -m venv .venv --system-site-packages
 touch .venv/COLCON_IGNORE
 source .venv/bin/activate
-pip install -r src/px4_slam/requirements.txt
-colcon build
+cd ~/repos/ws/src/px4_slam && \
+    rm -rf build install log && \
+    pip install -r requirements.txt && \
+    cd ~/repos/ws && \
+    colcon build
 ```
 
 ### setup px4  

@@ -1,3 +1,4 @@
 gtsam-develop 
 rerun-sdk
+scipy
 external/LightGlue

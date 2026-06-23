@@ -8,10 +8,11 @@ import rerun as rr
 import torch
 from geometry_msgs.msg import Pose, PoseStamped
 from lightglue import SuperPoint
-from px4_msgs.msg import SensorGps, VehicleMagnetometer
+from px4_msgs.msg import SensorGps, VehicleOdometry
 from px4_slam_interfaces.msg import LoopClosure, MatchedPoints
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import CameraInfo, Image
 
 torch.set_grad_enabled(False)
@@ -19,25 +20,6 @@ torch.set_float32_matmul_precision("high")
 
 
 class SuperFlow(Node):
-    latest_image_msg: Image | None
-    latest_camera_info_msg: CameraInfo | None
-    latest_pose: PoseStamped | None = None
-    latest_gps_msg: SensorGps | None = None
-    latest_mag_msg: VehicleMagnetometer | None = None
-    min_keyframe_distance: float = 5.0
-    min_keyframes: int = 20
-    min_separation: float = 2.0
-    keyframe_db: list[dict] = []
-    ref_sin_lat: float | None = None
-    ref_cos_lat: float | None = None
-    ref_lat: float | None = None
-    ref_lon: float | None = None
-    ref_alt: float | None = None
-
-    last_keyframe_pose: np.ndarray | None = None
-    keyframe_translation_threshold: float = 1.0
-    keyframe_rotation_threshold: float = np.radians(20)
-
     def __init__(self):
         super().__init__("super_flow")
 
@@ -64,18 +46,37 @@ class SuperFlow(Node):
             self.pose_callback,
             qos_profile=qos_profile_sensor_data,
         )
+        self._odometry_sub: rclpy.node.Subscription = self.create_subscription(
+            VehicleOdometry,
+            "fmu/out/vehicle_odometry",
+            self.odometry_callback,
+            qos_profile=qos_profile_sensor_data,
+        )
         self._gps_sub: rclpy.node.Subscription = self.create_subscription(
             SensorGps,
             "fmu/out/sensor_gps",
             self.gps_callback,
             qos_profile=qos_profile_sensor_data,
         )
-        self._magnetometer_sub: rclpy.node.Subscription = self.create_subscription(
-            VehicleMagnetometer,
-            "fmu/out/vehicle_magnetometer",
-            self.magnetometer_callback,
-            qos_profile=qos_profile_sensor_data,
-        )
+
+        self.latest_camera_info_msg: CameraInfo | None
+        self.latest_image_msg: Image | None
+        self.latest_pose: PoseStamped | None = None
+        self.latest_odom_msg: VehicleOdometry | None = None
+        self.latest_gps_msg: SensorGps | None = None
+        self.min_keyframe_distance: float = 5.0
+        self.min_keyframes: int = 20
+        self.min_separation: float = 2.0
+        self.keyframe_db: list[dict] = []
+        self.ref_sin_lat: float | None = None
+        self.ref_cos_lat: float | None = None
+        self.ref_lat: float | None = None
+        self.ref_lon: float | None = None
+        self.ref_alt: float | None = None
+
+        self.last_keyframe_pose: np.ndarray | None = None
+        self.keyframe_translation_threshold: float = 1.0
+        self.keyframe_rotation_threshold: float = np.radians(20)
 
         # superpoint for detection only, no matcher needed
         self.extractor: SuperPoint = (
@@ -94,7 +95,9 @@ class SuperFlow(Node):
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
         )
 
-        self.redetect_every: int = 118  # redetect with superpoint every N frames
+        self.redetect_every: int = (
+            120  # redetect with superpoint every N frames, TODO: fps
+        )
 
         # track state
         self.prev_gray: np.ndarray | None = None
@@ -113,42 +116,51 @@ class SuperFlow(Node):
 
         self.latest_image_msg: Image | None = None
         self.frame_count: int = 0
-        self.count: int = 0
+        self.keyframe_count: int = 0
 
     def ros_image_to_tensor(self, msg: Image) -> torch.Tensor:
         img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
+        # numpy is (h)eight, (w)idth, (c)hannel, but pytorch is (c, h, w)
+        # divide by 255.0 to turn 0-255 int into 0-1 float for pytorch
         tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
         if msg.encoding == "bgr8":
             tensor = tensor.flip(0)
         return tensor.cuda()
 
     def ros_image_to_gray(self, msg: Image) -> np.ndarray:
+        # Didn't want to have dependency on cv_bridge, old numpy
+        # beautiful!
         img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
         if msg.encoding == "bgr8":
             return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
     def ros_image_to_numpy(self, msg: Image) -> np.ndarray:
+        # see previous function
         img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
         if msg.encoding == "bgr8":
+            # new to me
+            # ... -> all preceeding dimensions (h, w)
+            # ::-1 -> reverse the last axis
+            # RGB turns to BGR
             img = img[..., ::-1]
         return img
 
     def detect_with_superpoint(self, msg: Image) -> tuple[np.ndarray, np.ndarray]:
         gpu_img = self.ros_image_to_tensor(msg)
         feats = self.extractor.extract(gpu_img)
-        kps = feats["keypoints"][0].cpu().numpy()  # (N, 2)
-        desc = feats["descriptors"][0].cpu().numpy()  # (N, 256)
+        kps = feats["keypoints"][0].cpu().numpy()  # (n, 2)
+        desc = feats["descriptors"][0].cpu().numpy()  # (n, 256)
 
         img_np = self.ros_image_to_numpy(msg)
-        sky_mask = self.get_sky_mask(img_np)
-        kps_int = kps.reshape(-1, 2).astype(int)
-        # clip to image bounds
-        kps_int[:, 0] = np.clip(kps_int[:, 0], 0, img_np.shape[1] - 1)
-        kps_int[:, 1] = np.clip(kps_int[:, 1], 0, img_np.shape[0] - 1)
-        valid = ~sky_mask[kps_int[:, 1], kps_int[:, 0]]
-        kps = kps[valid]
-        desc = desc[valid]
+        # sky_mask = self.get_sky_mask(img_np) # this feels weird
+        kps_int = kps.reshape(-1, 2).astype(int)  # do i need to reshape?
+
+        # if this ever trips, that is a bug in super flow and not us. if this is still
+        # here after a while, let's remove it
+        # times thought about this: 1
+        assert (kps_int[:, 0] >= 0).all() and (kps_int[:, 0] < img_np.shape[1]).all()
+        assert (kps_int[:, 1] >= 0).all() and (kps_int[:, 1] < img_np.shape[0]).all()
 
         return kps.reshape(-1, 1, 2).astype(np.float32), desc
 
@@ -163,20 +175,21 @@ class SuperFlow(Node):
             )
         return img
 
+    def initialize_track_ids(self, new_pts: np.ndarray, new_descs: np.ndarray):
+        new_ids = list(range(self.track_id, self.track_id + len(new_pts)))
+        self.track_id += len(new_pts)
+        for tid, desc in zip(new_ids, new_descs):
+            self.track_lengths[tid] = 1
+            self.track_descriptors[tid] = desc  # [1, 256]
+        self.track_ids = new_ids
+        self.get_logger().info(f"redetect: first frame, created {len(new_ids)} tracks")
+        return new_pts
+
     def redetect_and_merge(self, msg: Image) -> np.ndarray:
         new_pts, new_descs = self.detect_with_superpoint(msg)
 
-        if self.prev_pts is None or len(self.prev_pts) == 0:
-            new_ids = list(range(self.track_id, self.track_id + len(new_pts)))
-            self.track_id += len(new_pts)
-            for tid, desc in zip(new_ids, new_descs):
-                self.track_lengths[tid] = 1
-                self.track_descriptors[tid] = desc
-            self.track_ids = new_ids
-            self.get_logger().info(
-                f"redetect: first frame, created {len(new_ids)} tracks"
-            )
-            return new_pts
+        if self.prev_pts is None:
+            return self.initialize_track_ids(new_pts=new_pts, new_descs=new_descs)
 
         existing = self.prev_pts.reshape(-1, 2)
         candidates = new_pts.reshape(-1, 2)
@@ -303,27 +316,23 @@ class SuperFlow(Node):
     def store_keyframe(
         self,
         keyframe_id: int,
-        gps_msg: SensorGps,
-        pose: Pose,
+        pose: PoseStamped,
         descriptors: np.ndarray,
         pts: np.ndarray,
     ):
         if self.ref_sin_lat is None:
             return
-        north, east = self.project(gps_msg.latitude_deg, gps_msg.longitude_deg)
-        down = -(gps_msg.altitude_msl_m - self.ref_alt)
         assert self.latest_image_msg is not None
+        assert self.latest_odom_msg is not None
         img = self.ros_image_to_numpy(self.latest_image_msg).copy()
         # img_small = cv2.resize(img, (320, 240))
         self.keyframe_db.append(
             {
                 "keyframe_id": keyframe_id,
-                "ned_pos": np.array([north, east, down]),
                 "pose": pose,
                 "descriptors": descriptors,  # (K, 256) for current matched points
                 "pts": pts,  # (K, 2) pixel coordinates
-                "image": img,
-                # "image": img_small,
+                "image": img,  # should this be compressed?
             }
         )
         self.get_logger().info(
@@ -344,7 +353,9 @@ class SuperFlow(Node):
             )
             return []
         assert self.latest_pose is not None
-        curr_roll, curr_pitch, curr_yaw = self.rpy_from_pose(self.latest_pose.pose)
+        assert self.latest_odom_msg is not None
+        q = self.latest_odom_msg.q
+        curr_roll, curr_pitch, curr_yaw = Rotation(quat=[q[1], q[2], q[3], q[0]])
         curr_ned = self.position_from_pose(self.latest_pose.pose)
         candidates = []
         gps_candidates = 0
@@ -358,7 +369,9 @@ class SuperFlow(Node):
                 frames_since = len(self.keyframe_db) - idx
                 if frames_since > 10:
                     separation_candidates += 1
-                    past_roll, past_pitch, past_yaw = self.rpy_from_pose(kf["pose"])
+                    past_roll, past_pitch, past_yaw = self.rpy_from_pose(
+                        kf["pose"]
+                    )  # fix keyframe definition first
                     yaw_diff = abs(
                         np.arctan2(
                             np.sin(curr_yaw - past_yaw), np.cos(curr_yaw - past_yaw)
@@ -483,48 +496,46 @@ class SuperFlow(Node):
         # store as [x, y, z, qx, qy, qz, qw]
         return np.array([pos[0], pos[1], pos[2], q.x, q.y, q.z, q.w])
 
-    def get_sky_mask(self, img: np.ndarray) -> np.ndarray:
-        # img is RGB
-        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
-        # sky: hue around blue (100-130), low-ish saturation, high value
-        sky_pixels = (
-            (hsv[:, :, 0] >= 90)
-            & (hsv[:, :, 0] <= 140)
-            & (hsv[:, :, 1] < 100)
-            & (hsv[:, :, 2] > 150)
-        )
-        # also catch white/grey overcast sky
-        overcast = (hsv[:, :, 1] < 30) & (hsv[:, :, 2] > 200)
-        sky_pixels = sky_pixels | overcast
-
-        # connected components — only keep large regions
-        sky_uint8 = sky_pixels.astype(np.uint8) * 255
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky_uint8)
-        min_area = img.shape[0] * img.shape[1] * 0.01  # at least 1% of image
-        sky_mask = np.zeros_like(sky_pixels)
-        for label in range(1, num_labels):  # skip background label 0
-            if stats[label, cv2.CC_STAT_AREA] >= min_area:
-                sky_mask |= labels == label
-
-        return sky_mask
+    # idk about this
+    # def get_sky_mask(self, img: np.ndarray) -> np.ndarray:
+    #     # img is RGB
+    #     hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+    #     # sky: hue around blue (100-130), low-ish saturation, high value
+    #     sky_pixels = (
+    #         (hsv[:, :, 0] >= 90)
+    #         & (hsv[:, :, 0] <= 140)
+    #         & (hsv[:, :, 1] < 100)
+    #         & (hsv[:, :, 2] > 150)
+    #     )
+    #     # also catch white/grey overcast sky
+    #     overcast = (hsv[:, :, 1] < 30) & (hsv[:, :, 2] > 200)
+    #     sky_pixels = sky_pixels | overcast
+    #
+    #     # connected components — only keep large regions
+    #     sky_uint8 = sky_pixels.astype(np.uint8) * 255
+    #     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky_uint8)
+    #     min_area = img.shape[0] * img.shape[1] * 0.01  # at least 1% of image
+    #     sky_mask = np.zeros_like(sky_pixels)
+    #     for label in range(1, num_labels):  # skip background label 0
+    #         if stats[label, cv2.CC_STAT_AREA] >= min_area:
+    #             sky_mask |= labels == label
+    #
+    #     return sky_mask
 
     def image_callback(self, msg: Image):
+        self.get_logger().info("got here")
         gray = self.ros_image_to_gray(msg)
 
         # redetect with superpoint periodically or on first frame
         if self.prev_gray is None or self.frame_count % self.redetect_every == 0:
             self.prev_pts = self.redetect_and_merge(msg)
-            if self.prev_pts is None or len(self.prev_pts) == 0:
-                self.prev_gray = gray
-                self.frame_count += 1
-                return
             self.prev_gray = gray
             self.latest_image_msg = msg
             self.frame_count += 1
             return
 
         # track with lk optical flow
-        assert self.prev_pts is not None
+        # had an ai help me with type casting because i like knowing types
         result = cast(
             tuple[np.ndarray, np.ndarray, np.ndarray] | None,
             cv2.calcOpticalFlowPyrLK(  # ty: ignore
@@ -533,6 +544,7 @@ class SuperFlow(Node):
         )
         curr_pts: np.ndarray | None = result[0] if result is not None else None
         status: np.ndarray | None = result[1] if result is not None else None
+        # err: np.ndarray | None = result[2] if result is not None else None
 
         if curr_pts is None or status is None:
             self.get_logger().warn("optical flow failed, triggering redetection")
@@ -540,8 +552,10 @@ class SuperFlow(Node):
             self.frame_count += 1
             return
 
-        good_mask = status.ravel() == 1
+        # ravel is like flatten, but tries to return a view and not a copy
+        good_mask = status.ravel() == 1  # == 1 to create boolean mask
         pts1 = curr_pts[good_mask].reshape(-1, 2)
+        # note to self: consider numpy array in the future
         track_ids = [tid for tid, ok in zip(self.track_ids, good_mask) if ok]
 
         # move dead tracks to lost
@@ -604,7 +618,7 @@ class SuperFlow(Node):
             if self.should_publish_keyframe():
                 msg_out = MatchedPoints()
                 msg_out.header.stamp = self.get_clock().now().to_msg()
-                msg_out.keyframe_id = self.count
+                msg_out.keyframe_id = self.keyframe_count
                 msg_out.points_x = mature_pts1[:, 0].tolist()
                 msg_out.points_y = mature_pts1[:, 1].tolist()
                 if mature_descs is not None:
@@ -636,8 +650,7 @@ class SuperFlow(Node):
             store_keyframe = self.should_store_keyframe(current_gps)
             if store_keyframe:
                 self.store_keyframe(
-                    keyframe_id=self.count,
-                    gps_msg=self.latest_gps_msg,
+                    keyframe_id=self.keyframe_count,
                     pose=self.latest_pose.pose,
                     descriptors=mature_descs,
                     pts=mature_pts1,
@@ -653,7 +666,7 @@ class SuperFlow(Node):
                     if success:
                         lc_msg = LoopClosure()
                         lc_msg.header.stamp = self.get_clock().now().to_msg()
-                        lc_msg.current_keyframe_id = self.count
+                        lc_msg.current_keyframe_id = self.keyframe_count
                         lc_msg.loop_keyframe_id = candidate["keyframe_id"]
                         lc_msg.points0_x = pts_curr[:, 0].tolist()  # ty: ignore
                         lc_msg.points0_y = pts_curr[:, 1].tolist()  # ty: ignore
@@ -683,9 +696,9 @@ class SuperFlow(Node):
                         self.get_logger().info(
                             f"pts_curr: {len(pts_curr)}, pts_past: {len(pts_past)}"  # ty: ignore
                         )
-                        rr.set_time("keyframe", sequence=self.count)
+                        rr.set_time("keyframe", sequence=self.keyframe_count)
                         rr.log(
-                            f"world/loop_closures/{self.count}",
+                            f"world/loop_closures/{self.keyframe_count}",
                             rr.LineStrips3D(
                                 [[curr_pos, past_pos]], colors=[[255, 100, 0]]
                             ),
@@ -714,7 +727,7 @@ class SuperFlow(Node):
                                 -1,
                             )
 
-                        rr.set_time("keyframe", sequence=self.count)
+                        rr.set_time("keyframe", sequence=self.keyframe_count)
                         rr.log("loop_closure/current_image", rr.Image(img_curr_np))
                         rr.log("loop_closure/past_image", rr.Image(img_past_np))
                         break
@@ -776,16 +789,16 @@ class SuperFlow(Node):
         self.track_ids = track_ids
         self.latest_image_msg = msg
         self.frame_count += 1
-        self.count += 1
+        self.keyframe_count += 1
 
     def pose_callback(self, msg: PoseStamped):
         self.latest_pose = msg
 
+    def odometry_callback(self, msg: VehicleOdometry):
+        self.latest_odom_msg = msg
+
     def gps_callback(self, msg: SensorGps):
         self.latest_gps_msg = msg
-
-    def magnetometer_callback(self, msg: VehicleMagnetometer):
-        self.latest_mag_msg = msg
 
 
 def main(args=None):
