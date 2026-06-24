@@ -26,13 +26,11 @@ class SuperFlow(Node):
         super().__init__("super_flow")
 
         self.declare_parameter("recording_id", str(int(time.time())))
-        self.declare_parameter("keyframe_window", 5)
+        self.declare_parameter("min_kfs", 5)
         recording_id = (
             self.get_parameter("recording_id").get_parameter_value().string_value
         )
-        kf_window = (
-            self.get_parameter("keyframe_window").get_parameter_value().integer_value
-        )
+        min_kfs = self.get_parameter("min_kfs").get_parameter_value().integer_value
 
         rr.init("super_flow", recording_id=recording_id)
         rr.spawn()
@@ -116,9 +114,9 @@ class SuperFlow(Node):
         self.track_history: dict[int, list[tuple[int, int]]] = {}
         self.min_track_length: int = 30
 
-        self.keyframes: dict[int, Keyframe] = {}
+        self.kfs: dict[int, Keyframe] = {}
         self.tracks: dict[int, Track] = {}
-        self.kf_window: int = kf_window
+        self.min_kfs: int = min_kfs
 
         self.frame_count: int = 0
         self.keyframe_count: int = 0
@@ -205,12 +203,14 @@ class SuperFlow(Node):
         return kf
 
     def get_recent_keyframes(self, n: int) -> list[Keyframe]:
-        keys = list(self.keyframes.keys())
+        keys = list(self.kfs.keys())
         recent_keys = keys[-n:]
-        return [self.keyframes[k] for k in recent_keys]
+        return [self.kfs[k] for k in recent_keys]
 
-    def get_latest_keyframe(self) -> Keyframe:
-        return self.get_recent_keyframes(n=1)[0]
+    def get_latest_keyframe(self) -> Keyframe | None:
+        if self.kfs:
+            return self.get_recent_keyframes(n=1)[0]
+        return None
 
     def redetect_and_merge(self, img: np.ndarray):
         if self.latest_odom_msg is None:
@@ -230,8 +230,12 @@ class SuperFlow(Node):
         self.get_logger().info(
             f"redetect: first frame, Keyframe added with {len(new_pts)} kps"
         )
+        self.get_logger().info(f"kfs: {len(self.kfs)}")
 
-        recent_kfs = self.get_recent_keyframes(n=self.kf_window)
+        recent_kfs = self.get_recent_keyframes(n=self.min_kfs)
+
+        if len(self.kfs) < self.min_kfs:
+            self.kfs[new_kf.kf_id] = new_kf
 
         for kf in recent_kfs:
             scores = new_kf.desc @ kf.desc.T
@@ -251,7 +255,7 @@ class SuperFlow(Node):
                 self.tracks[track_id].count += 1
                 self.tracks[track_id].last_seen_frame = new_kf.kf_id
 
-            self.keyframes[new_kf.kf_id] = new_kf
+            self.kfs[new_kf.kf_id] = new_kf
 
     def init_reference(self, lat_0, lon_0, alt_0):
         self.ref_alt = alt_0
@@ -282,17 +286,14 @@ class SuperFlow(Node):
         return north, east
 
     def image_callback(self, msg: Image):
-        gray = self.ros_image_to_gray(msg)
+        img = self.ros_image_to_numpy(msg)
 
         # redetect with superpoint periodically or on first frame
-        if (
-            not self.keyframes
-            or self.prev_img is None
-            or self.frame_count % self.redetect_every == 0
-        ):
-            self.redetect_and_merge(gray)
-            self.prev_pts = self.get_latest_keyframe().kps
-            self.prev_img = gray
+        if self.prev_pts is None or self.frame_count % self.redetect_every == 0:
+            self.redetect_and_merge(img)
+            kf = self.get_latest_keyframe()
+            self.prev_pts = kf.kps if kf else None
+            self.prev_img = img
             self.frame_count += 1  # ? maybe can get the boot
             return
 
@@ -301,7 +302,7 @@ class SuperFlow(Node):
         result = cast(
             tuple[np.ndarray, np.ndarray, np.ndarray] | None,
             cv2.calcOpticalFlowPyrLK(  # ty: ignore
-                self.prev_img, gray, self.prev_pts, None, **self.lk_params
+                self.prev_img, img, self.prev_pts, None, **self.lk_params
             ),
         )
         curr_pts: np.ndarray | None = result[0] if result is not None else None
@@ -317,8 +318,18 @@ class SuperFlow(Node):
         # ravel is like flatten, but tries to return a view and not a copy
         good_mask = status.ravel() == 1  # == 1 to create boolean mask
         pts1 = curr_pts[good_mask].reshape(-1, 2)
+        breakpoint()
 
         # TODO: log the points
+
+    def log_kps(self, img: np.ndarray, kps: np.ndarray):
+        pretty = img.copy()
+        for kp in kps:
+            pretty = cv2.circle(
+                img=pretty, center=kp, radius=-1, color=(255, 0, 0), thickness=-1
+            )
+
+        rr.log("world/image", rr.Image(pretty))
 
     def pose_callback(self, msg: PoseStamped):
         self.latest_pose = msg
