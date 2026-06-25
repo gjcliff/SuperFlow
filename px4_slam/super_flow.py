@@ -318,18 +318,18 @@ class SuperFlow(Node):
         # ravel is like flatten, but tries to return a view and not a copy
         good_mask = status.ravel() == 1  # == 1 to create boolean mask
         pts1 = curr_pts[good_mask].reshape(-1, 2)
-        breakpoint()
+        self.log_kps("world/img/kps", img, pts1)
 
         # TODO: log the points
 
-    def log_kps(self, img: np.ndarray, kps: np.ndarray):
+    def log_kps(self, key: str, img: np.ndarray, kps: np.ndarray):
         pretty = img.copy()
         for kp in kps:
             pretty = cv2.circle(
                 img=pretty, center=kp, radius=-1, color=(255, 0, 0), thickness=-1
             )
 
-        rr.log("world/image", rr.Image(pretty))
+        rr.log(key, rr.Image(pretty))
 
     def pose_callback(self, msg: PoseStamped):
         self.latest_pose = msg
