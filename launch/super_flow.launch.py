@@ -1,6 +1,10 @@
+from time import time
+
 from launch_ros.actions import Node
 
 from launch import LaunchDescription
+
+rec_id = str(int(time()))
 
 
 def generate_launch_description():
@@ -11,19 +15,14 @@ def generate_launch_description():
                 namespace="",
                 executable="super_flow",
                 name="super_flow",
+                parameters=[{"recording_id": rec_id}],
             ),
             Node(
-                package="ros_gz_bridge",
-                executable="parameter_bridge",
-                arguments=[
-                    "/world/baylands/model/x500_mono_cam_0/link/camera_link/sensor/imager/image@sensor_msgs/msg/Image@gz.msgs.Image",
-                    "/world/baylands/model/x500_mono_cam_0/link/camera_link/sensor/imager/camera_info@sensor_msgs/msg/CameraInfo@gz.msgs.CameraInfo",
-                ],
-                remappings=[
-                    ("/world/baylands/model/x500_mono_cam_0/link/camera_link/sensor/imager/image", "/camera/image_raw"),
-                    ("/world/baylands/model/x500_mono_cam_0/link/camera_link/sensor/imager/camera_info", "/camera/camera_info"),
-                ],
-                output="screen",
+                package="px4_slam",
+                namespace="",
+                executable="backend",
+                name="backendsuper_flow",
+                parameters=[{"recording_id": rec_id}],
             ),
         ]
     )

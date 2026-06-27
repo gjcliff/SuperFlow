@@ -1,8 +1,10 @@
 from dataclasses import asdict, dataclass
-from typing import ClassVar
+from typing import ClassVar, Self
 
 import numpy as np
+import rclpy.clock
 import rerun as rr
+from px4_slam_interfaces.msg import Keyframe as KeyframeMsg
 
 
 @dataclass
@@ -11,9 +13,9 @@ class Keyframe:
     desc: np.ndarray  # [n, 256]
     position: np.ndarray  # [3,]
     q: np.ndarray  # [1, 4] wxyz
-    rot: np.ndarray  # [3, 3]
     track_ids: np.ndarray  # [n, 1]
     kf_id: int = 0
+    img_size: tuple[int, int] = (0, 0)
     log: bool = False
 
     _next_id: ClassVar[int] = 0
@@ -23,6 +25,25 @@ class Keyframe:
         Keyframe._next_id += 1
         if self.log:
             self.log_keyframe_txt()
+
+    def is_close(
+        self,
+        position: np.ndarray,
+        q: np.ndarray,
+        pos_thresh: float = 5.0,
+        orientation_thresh: float = 0.9,
+    ) -> bool:
+        if np.linalg.norm(self.position - position) > pos_thresh:
+            return False
+        return np.abs(np.dot(self.q, q)) > orientation_thresh
+
+    def get_descs_for_tracks(
+        self, track_ids: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        mask = np.isin(track_ids, self.track_ids)
+        sorter = np.argsort(self.track_ids)
+        idx = sorter[np.searchsorted(self.track_ids, track_ids[mask], sorter=sorter)]
+        return mask, self.desc[idx]
 
     def log_keyframe_img(self, img: np.ndarray):
         rr.log(f"keyframes/{self.kf_id}/img", rr.Image(img), static=True)
@@ -61,6 +82,34 @@ class Keyframe:
             rr.TextLog(self.track_ids.shape[0]),
             static=True,
         )
+
+    @classmethod
+    def from_ros_msg(cls, msg: KeyframeMsg) -> Self:
+        return cls(
+            kf_id=msg.kf_id,
+            kps=np.column_stack([msg.kps_x, msg.kps_y]),
+            desc=np.empty(0),
+            position=np.array(msg.position),
+            q=np.array(msg.q),
+            track_ids=np.array(msg.track_ids),
+            img_size=msg.img_size,
+            log=False,
+        )
+
+    def to_ros_msg(self, clock: rclpy.clock.Clock) -> KeyframeMsg:
+        msg = KeyframeMsg()
+        msg.header.stamp = clock.now().to_msg()
+        msg.header.frame_id = "world"
+        msg.kf_id = self.kf_id
+        msg.kps_x = self.kps[:, 0].astype(np.float32).tolist()
+        msg.kps_y = self.kps[:, 1].astype(np.float32).tolist()
+        msg.track_ids = self.track_ids.astype(np.uint32).tolist()
+        msg.position = self.position.astype(np.float32).tolist()
+        msg.img_size = self.img_size
+        msg.q = self.q.astype(np.float32).tolist()
+        msg.log=self.log
+
+        return msg
 
     @classmethod
     def get_next_id(cls):

@@ -6,13 +6,13 @@ import rclpy
 import rerun as rr
 from geometry_msgs.msg import PoseStamped
 from gtsam.symbol_shorthand import V, X
-from px4_msgs.msg import (
-    VehicleLocalPosition,
-)
-from px4_slam_interfaces.msg import LoopClosure, MatchedPoints
+from px4_msgs.msg import VehicleOdometry
+from px4_slam_interfaces.msg import Keyframe as KeyframeMsg
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo
+
+from px4_slam.data import Keyframe
 
 
 class Backend(Node):
@@ -24,26 +24,20 @@ class Backend(Node):
             self.get_parameter("recording_id").get_parameter_value().string_value
         )
 
-        rr.init("super_flow", recording_id=recording_id)
+        rr.init("superflow", recording_id=recording_id)
         rr.connect_grpc()
         rr.log("world", rr.ViewCoordinates.FRD, static=True)
 
         self._local_position_sub = self.create_subscription(
-            VehicleLocalPosition,
-            "fmu/out/vehicle_local_position",
-            self.local_position_callback,
+            VehicleOdometry,
+            "fmu/out/vehicle_odometry",
+            self.odometry_callback,
             qos_profile=qos_profile_sensor_data,
         )
-        self._matched_points_sub = self.create_subscription(
-            MatchedPoints,
-            "camera/matched_points",
-            self.matched_points_callback,
-            qos_profile=qos_profile_sensor_data,
-        )
-        self._loop_closure_sub = self.create_subscription(
-            LoopClosure,
-            "camera/loop_closure",
-            self.loop_closure_callback,
+        self._keyframe_sub = self.create_subscription(
+            KeyframeMsg,
+            "superflow/keyframe",
+            self.keyframe_callback,
             qos_profile=qos_profile_sensor_data,
         )
         self._camera_info_sub = self.create_subscription(
@@ -61,7 +55,7 @@ class Backend(Node):
         self.count: int = 0
         self.prev_imu_timestamp: int | None = None
 
-        self.latest_local_pos_msg: VehicleLocalPosition | None = None
+        self.latest_odom_msg: VehicleOdometry | None = None
         self.isam: gtsam.ISAM2
         self.K: gtsam.Cal3_S2 | None = None
         self.pixel_noise: gtsam.noiseModel.Isotropic
@@ -103,10 +97,6 @@ class Backend(Node):
         self.isam.update(init_graph, init_values)
         self.initialized = True
 
-    # ------------------------------------------------------------------
-    # graph initialisation helpers
-    # ------------------------------------------------------------------
-
     def set_priors(
         self, graph: gtsam.NonlinearFactorGraph, values: gtsam.Values
     ) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Values]:
@@ -120,25 +110,6 @@ class Backend(Node):
         graph.push_back(gtsam.PriorFactorVector(V(0), initial_vel, vel_noise))
         values.insert(V(0), initial_vel)
         return graph, values
-
-    # ------------------------------------------------------------------
-    # logging / publishing
-    # ------------------------------------------------------------------
-
-    def publish_pose(self, pose: gtsam.Pose3):
-        msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "world"
-        t = pose.translation()
-        q = pose.rotation().toQuaternion()
-        msg.pose.position.x = t[0]
-        msg.pose.position.y = t[1]
-        msg.pose.position.z = t[2]
-        msg.pose.orientation.x = q.x()
-        msg.pose.orientation.y = q.y()
-        msg.pose.orientation.z = q.z()
-        msg.pose.orientation.w = q.w()
-        self._pose_pub.publish(msg)
 
     def log_pose(self, pose: gtsam.Pose3):
         t = pose.translation()
@@ -158,193 +129,65 @@ class Backend(Node):
             rr.LineStrips3D([self.trajectory], colors=[[0, 200, 255]]),
         )
 
-    # ------------------------------------------------------------------
-    # matched points callback — attaches visual factors to existing pose keys
-    # the imu graph has already created and initialized X(count) before this
-    # is ever called, so we never need to insert new variables here
-    # ------------------------------------------------------------------
+    def keyframe_callback(self, msg: KeyframeMsg):
+        self.get_logger().info("got kf")
+        kf = Keyframe.from_ros_msg(msg)
+        self.log_kf_pinhole(kf)
 
-    def matched_points_callback(self, msg: MatchedPoints) -> None:
-        if not self.initialized:
-            return
+    def log_kf_pinhole(self, kf: Keyframe):
         if self.K is None:
-            self.get_logger().warn("no camera calibration yet, dropping keyframe")
             return
+        q = kf.q  # [w, x, y, z]
+        world_R_body = gtsam.Rot3.Quaternion(q[0], q[1], q[2], q[3])
+        world_t_body = gtsam.Point3(*kf.position)
+        world_T_body = gtsam.Pose3(world_R_body, world_t_body)
 
-        # snapshot the current imu pose index — this is the pose key we'll
-        # attach observations to. the imu callback may increment count while
-        # we're running but that's fine; we just use whatever is current now.
-        current_pose_key = self.count
+        # camera pose in world frame
+        world_T_cam = world_T_body.compose(self.body_P_cam)
 
-        pts_x: list[float] = msg.points_x
-        pts_y: list[float] = msg.points_y
-        track_ids: list[int] = list(msg.track_ids)
+        # extract for rerun
+        t = world_T_cam.translation()
+        q_cam = (
+            world_T_cam.rotation().toQuaternion()
+        )  # gtsam quaternion is [w, x, y, z]
 
-        new_factor_graph = gtsam.NonlinearFactorGraph()
-
-        for tid, u, v in zip(track_ids, pts_x, pts_y):
-            observation = np.array([u, v])
-
-            if tid not in self.smart_factors:
-                if tid in self._pending_observations:
-                    # second observation — promote to a real smart factor
-                    prev_key, prev_obs = self._pending_observations.pop(tid)
-                    factor = gtsam.SmartProjectionPoseFactorCal3_S2(
-                        self.pixel_noise,
-                        self.K,
-                        self.body_P_cam,
-                        self.smart_params,
-                    )
-                    factor.add(prev_obs, X(prev_key))
-                    factor.add(observation, X(current_pose_key))
-                    self.smart_factors[tid] = factor
-                    self.track_pose_keys[tid] = {prev_key, current_pose_key}
-                    new_factor_graph.push_back(factor)
-                else:
-                    # first observation — buffer and wait for a second keyframe
-                    self._pending_observations[tid] = (current_pose_key, observation)
-                continue
-
-            # existing factor — add the new observation if this pose key is new
-            factor = self.smart_factors[tid]
-            if current_pose_key not in self.track_pose_keys[tid]:
-                factor.add(observation, X(current_pose_key))
-                self.track_pose_keys[tid].add(current_pose_key)
-
-        if new_factor_graph.size() > 0:
-            try:
-                self.isam.update(new_factor_graph, gtsam.Values())
-            except RuntimeError as e:
-                self.get_logger().error(
-                    f"isam update (new smart factors) failed at pose {current_pose_key}: {e}"
-                )
-                self._reset_visual()
-                return
-
-        # re-linearize mutated smart factors
-        try:
-            self.isam.update(gtsam.NonlinearFactorGraph(), gtsam.Values())
-        except RuntimeError as e:
-            self.get_logger().error(
-                f"isam re-linearization failed at pose {current_pose_key}: {e}"
-            )
-            self._reset_visual()
-            return
-
-        # debug logging for track 0
-        if self.smart_factors:
-            tid = next(iter(self.smart_factors))
-            factor = self.smart_factors[tid]
-            n_obs = len(self.track_pose_keys[tid])
-            current_values = self.isam.calculateEstimate()
-            result = factor.point(current_values)
-            pose = self.isam.calculateEstimatePose3(X(current_pose_key))
-            t = pose.translation()
-
-            if result.valid():
-                status_str = "valid"
-            elif result.degenerate():
-                status_str = "degen"
-            elif result.behindCamera():
-                status_str = "behind"
-            elif result.farPoint():
-                status_str = "far"
-            elif result.outlier():
-                status_str = "outlier"
-            else:
-                status_str = f"unknown({result.status})"
-
-            self.get_logger().info(
-                f"track {tid}: {n_obs} obs, "
-                f"pose=({t[0]:.2f},{t[1]:.2f},{t[2]:.2f}), "
-                f"status={status_str}"
-            )
-
-            if result.valid() or result.farPoint():
-                p = result.get()
-                cam_pose = pose.compose(self.body_P_cam)
-                p_cam = cam_pose.transformTo(
-                    gtsam.Point3(float(p[0]), float(p[1]), float(p[2]))
-                )
-                dist = float(np.linalg.norm([p_cam[0], p_cam[1], p_cam[2]]))
-                self.get_logger().info(
-                    f"  point=({float(p[0]):.2f},{float(p[1]):.2f},{float(p[2]):.2f}), "
-                    f"dist_from_cam={dist:.1f}m"
-                )
-                if self.K is not None and p_cam[2] > 0.1:
-                    u_proj = self.K.fx() * p_cam[0] / p_cam[2] + self.K.px()
-                    v_proj = self.K.fy() * p_cam[1] / p_cam[2] + self.K.py()
-                    self.get_logger().info(
-                        f"  reprojected pixel=({u_proj:.1f}, {v_proj:.1f})"
-                    )
-                    rr.set_time("keyframe", sequence=current_pose_key)
-                    rr.log(
-                        "camera/debug_projection",
-                        rr.Points2D(
-                            [[u_proj, v_proj]],
-                            radii=8.0,
-                            colors=[
-                                [255, 80, 0] if status_str != "valid" else [0, 255, 80]
-                            ],
-                            labels=[f"tid={tid} {status_str} d={dist:.0f}m"],
-                        ),
-                    )
-                rr.set_time("keyframe", sequence=current_pose_key)
-                rr.log(
-                    "world/points",
-                    rr.Points3D(
-                        [[float(p[0]), float(p[1]), float(p[2])]],
-                        colors=[
-                            [255, 80, 0] if status_str != "valid" else [255, 200, 0]
-                        ],
-                    ),
-                )
-
-    # ------------------------------------------------------------------
-    # visual-only reset - drops smart factors without touching the imu graph.
-    # the pose variables remain valid so the imu graph keeps running cleanly.
-    # ------------------------------------------------------------------
-
-    def _reset_visual(self):
-        self.smart_factors = {}
-        self.track_pose_keys = {}
-        self._pending_observations = {}
-        self.get_logger().warn(
-            "visual factors reset — imu/gps graph intact, continuing from pose X(%d)",
-            self.count,
+        rr.log(
+            f"world/camera/keyframes/{kf.kf_id}",
+            rr.Transform3D(
+                translation=np.array([t[0], t[1], t[2]]),
+                rotation=rr.Quaternion(
+                    xyzw=[q_cam.x(), q_cam.y(), q_cam.z(), q_cam.w()]
+                ),
+            ),
         )
-
-    # loop closure
-    def loop_closure_callback(self, msg: LoopClosure) -> None:
-        curr_key = msg.current_keyframe_id
-        loop_key = msg.loop_keyframe_id
-
-        if curr_key > self.count or loop_key > self.count:
-            self.get_logger().warn(
-                f"loop closure references future keyframe ({curr_key}, {loop_key}), dropping"
-            )
-            return
-
-        pose_curr = self.isam.calculateEstimatePose3(X(curr_key))
-        pose_loop = self.isam.calculateEstimatePose3(X(loop_key))
-        between = pose_loop.between(pose_curr)
-
-        between_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([0.1, 0.1, 0.1, 0.3, 0.3, 0.3])
+        rr.log(
+            f"world/camera/keyframes/{kf.kf_id}/pinhole",
+            rr.Pinhole(
+                focal_length=(self.K.fx(), self.K.fy()),
+                principal_point=(self.K.px(), self.K.py()),
+                width=kf.img_size[1],
+                height=kf.img_size[0],
+            ),
         )
-        factor = gtsam.BetweenFactorPose3(
-            X(loop_key), X(curr_key), between, between_noise
-        )
-        graph = gtsam.NonlinearFactorGraph()
-        graph.add(factor)
-        self.isam.update(graph, gtsam.Values())
-        self.get_logger().info(f"loop closure added: X({loop_key}) -> X({curr_key})")
 
     # ------------------------------------------------------------------
     # sensor callbacks
     # ------------------------------------------------------------------
-    def local_position_callback(self, msg: VehicleLocalPosition):
-        self.latest_local_pos_msg = msg
+    def odometry_callback(self, msg: VehicleOdometry):
+        self.latest_odom_msg = msg
+        rr.log(
+            "world/camera/pose",
+            rr.Transform3D(
+                translation=msg.position,
+                rotation=rr.Quaternion(xyzw=[msg.q[1], msg.q[2], msg.q[3], msg.q[0]]),
+            ),
+            static=True,
+        )
+        rr.log(
+            "world/camera/pose/axes",
+            rr.TransformAxes3D(axis_length=1.0),
+            static=True,
+        )
 
     def camera_info_callback(self, msg: CameraInfo):
         if self.K is None:

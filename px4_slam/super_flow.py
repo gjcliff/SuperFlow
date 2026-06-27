@@ -6,26 +6,18 @@ import numpy as np
 import rclpy
 import rerun as rr
 import torch
-from geometry_msgs.msg import PoseStamped
 from lightglue import SuperPoint
 from px4_msgs.msg import SensorGps, VehicleOdometry
-from px4_slam_interfaces.msg import LoopClosure, MatchedPoints
+from px4_slam_interfaces.msg import Keyframe as KeyframeMsg
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from scipy.spatial.transform import Rotation
-from sensor_msgs.msg import CameraInfo, Image
+from scipy.spatial import KDTree
+from sensor_msgs.msg import Image
 
 from px4_slam.data import IDGenerator, Keyframe
 
 torch.set_grad_enabled(False)
 torch.set_float32_matmul_precision("high")
-
-
-class FlowTracker:
-    def __init__(self, img_shape: tuple[int, int]):
-        self.mask = np.zeros(img_shape, dtype=np.uint8)
-        self.p0 = None
-        self.old_gray = None
 
 
 class SuperFlow(Node):
@@ -39,23 +31,15 @@ class SuperFlow(Node):
         )
         min_kfs = self.get_parameter("min_kfs").get_parameter_value().integer_value
 
-        rr.init("super_flow", recording_id=recording_id)
+        rr.init("superflow", recording_id=recording_id)
         rr.spawn()
+        rr.log("world", rr.ViewCoordinates.FRD, static=True)
 
-        self._matched_points_pub: rclpy.node.Publisher = self.create_publisher(
-            MatchedPoints, "camera/matched_points", qos_profile_sensor_data
-        )
-        self._loop_closure_pub: rclpy.node.Publisher = self.create_publisher(
-            LoopClosure, "camera/loop_closure", qos_profile_sensor_data
+        self._keyframe_pub: rclpy.node.Publisher = self.create_publisher(
+            KeyframeMsg, "superflow/keyframe", qos_profile_sensor_data
         )
         self._image_sub: rclpy.node.Subscription = self.create_subscription(
             Image, "camera/image_raw", self.image_callback, qos_profile_sensor_data
-        )
-        self._state_estimate_sub: rclpy.node.Subscription = self.create_subscription(
-            PoseStamped,
-            "state_estimate/pose",
-            self.pose_callback,
-            qos_profile=qos_profile_sensor_data,
         )
         self._odometry_sub: rclpy.node.Subscription = self.create_subscription(
             VehicleOdometry,
@@ -63,28 +47,12 @@ class SuperFlow(Node):
             self.odometry_callback,
             qos_profile=qos_profile_sensor_data,
         )
-        self._gps_sub: rclpy.node.Subscription = self.create_subscription(
-            SensorGps,
-            "fmu/out/sensor_gps",
-            self.gps_callback,
-            qos_profile=qos_profile_sensor_data,
-        )
-
-        self.latest_camera_info_msg: CameraInfo | None
-        self.latest_pose: PoseStamped | None = None
-        self.latest_odom_msg: VehicleOdometry | None = None
-        self.latest_gps_msg: SensorGps | None = None
-        self.min_separation: float = 2.0
-        self.keyframe_db: list[dict] = []
-        self.ref_sin_lat: float | None = None
-        self.ref_cos_lat: float | None = None
-        self.ref_lat: float | None = None
-        self.ref_lon: float | None = None
-        self.ref_alt: float | None = None
-
-        self.last_keyframe_pose: np.ndarray | None = None
-        self.keyframe_translation_threshold: float = 1.0
-        self.keyframe_rotation_threshold: float = np.radians(20)
+        # self._gps_sub: rclpy.node.Subscription = self.create_subscription(
+        #     SensorGps,
+        #     "fmu/out/sensor_gps",
+        #     self.gps_callback,
+        #     qos_profile=qos_profile_sensor_data,
+        # )
 
         # superpoint for detection only, no matcher needed
         self.extractor: SuperPoint = (
@@ -106,30 +74,28 @@ class SuperFlow(Node):
         self.redetect_every: int = (
             120  # redetect with superpoint every N frames, TODO: fps
         )
+        self.min_track_length: int = 30
+        self.kp_match_thresh: float = 0.8
+        self.max_tracks = 50_000
 
         # track state
         self.prev_gray: np.ndarray | None = None
         self.prev_pts: np.ndarray | None = None  # this will go
         self.prev_track_ids: np.ndarray | None = None
         self.mask: np.ndarray | None = None  # = np.zeros(img_shape, dtype=np.uint8)
-        self.track_ids: list[int] = []
-        self.track_lengths: dict[int, int] = {}
-        # track_id -> (256,) descriptor
-        self.track_descriptors: dict[int, np.ndarray] = {}
-        # recently lost track_id -> descriptor
-        self.lost_track_descriptors: dict[int, np.ndarray] = {}
-        self.lost_track_age: dict[int, int] = {}  # track_id -> frames since lost
-        # track_id -> list of (x, y)
-        self.track_history: dict[int, list[tuple[int, int]]] = {}
-        self.min_track_length: int = 30
-        self.kp_match_thresh: float = 0.8
 
         self.kfs: dict[int, Keyframe] = {}
-        self.max_tracks = 50_000
+        self.kdtree: KDTree | None = None
         self.track_counts: np.ndarray = np.empty(0, dtype=np.uint32)
         self.min_kfs: int = min_kfs
 
-        self.keyframe_count: int = 0
+        self.latest_odom_msg: VehicleOdometry | None = None
+        self.latest_gps_msg: SensorGps | None = None
+        self.ref_sin_lat: float | None = None
+        self.ref_cos_lat: float | None = None
+        self.ref_lat: float | None = None
+        self.ref_lon: float | None = None
+        self.ref_alt: float | None = None
 
     def gray_img_to_tensor(self, img: np.ndarray):
         tensor = torch.from_numpy(img).float() / 255.0
@@ -176,19 +142,30 @@ class SuperFlow(Node):
 
         return kps.reshape(-1, 2).astype(np.float32), desc
 
-    def draw_track_ids(
-        self, img: np.ndarray, pts: np.ndarray, track_ids: list[int]
-    ) -> np.ndarray:
-        img = img.copy()
+    def draw_track_ids(self, img: np.ndarray, pts: np.ndarray, track_ids: np.ndarray):
         for pt, tid in zip(pts, track_ids):
             x, y = int(pt[0]), int(pt[1])
+            count = self.track_counts[tid]
             cv2.putText(
-                img, str(tid), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1
+                img,
+                f"{tid}, {count}",
+                (x, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.3,
+                (0, 255, 0),
+                1,
             )
-        return img
 
-    def create_keyframe(
-        self, new_pts: np.ndarray, new_descs: np.ndarray
+    def rebuild_kdtree(self):
+        positions = np.array([kf.position for kf in self.kfs.values()])
+        self.kdtree = KDTree(positions)
+
+    def create_kf(
+        self,
+        new_pts: np.ndarray,
+        new_descs: np.ndarray,
+        img_size: tuple[int, int],
+        track_ids: np.ndarray | None = None,
     ) -> Keyframe | None:
         # am i cheating?
         # this could also come from gps and attitude
@@ -197,19 +174,26 @@ class SuperFlow(Node):
 
         # tracks handle creating and incrementing their own ids
 
-        q = self.latest_odom_msg.q
         # keyframes also handle creating and incrementing their own ids
+        track_ids = (
+            np.zeros(new_pts.shape[0], dtype=np.uint32)
+            if track_ids is None
+            else track_ids
+        )
         kf = Keyframe(
             kps=new_pts,
             desc=new_descs,
-            track_ids=np.zeros(
-                new_pts.shape[0], dtype=np.uint32
-            ),  # these will be replaced by matches' ids
+            track_ids=track_ids,
             position=self.latest_odom_msg.position,
             q=self.latest_odom_msg.q,
-            rot=Rotation(quat=[q[1], q[2], q[3], q[0]]).as_matrix(),
+            img_size=img_size,
             log=True,
         )
+        self.get_logger().info(
+            f"new kf with {kf.kps.shape} points, {kf.desc.shape} desc, {kf.track_ids.shape} tracks"
+        )
+
+        self.publish_kf(kf)
 
         return kf
 
@@ -226,19 +210,22 @@ class SuperFlow(Node):
         return None
 
     def associate_tracks(self, new_kf: Keyframe):
-        """Update track_ids in the new kf if they already exist"""
-        for kf in self.get_recent_keyframes(n=self.min_kfs):
-            scores = new_kf.desc @ kf.desc.T
-            matches = np.argmax(scores, axis=1)
-            expected = np.arange(len(matches))  # every single kp is a match
-            if np.array_equal(matches, expected):
-                continue
+        """Update track_ids in the new kf if they already exist
 
-            best_scores = scores[np.arange(len(matches)), matches]
-            valid = best_scores > self.kp_match_thresh
-            self.get_logger().debug(f"num valid: {len(valid)}")
-            matched_track_ids = kf.track_ids[matches]
-            new_kf.track_ids[valid] = matched_track_ids[valid]
+        this is mainly a front-end only function, we just want it to track points from
+        one kf to another. loop closure if for older kfs
+        """
+        kf = self.get_latest_keyframe()
+        if kf is None:
+            return
+        scores = new_kf.desc @ kf.desc.T
+        matches = np.argmax(scores, axis=1)
+
+        best_scores = scores[np.arange(len(matches)), matches]
+        valid = best_scores > self.kp_match_thresh
+        self.get_logger().debug(f"num valid: {len(valid)}")
+        matched_track_ids = kf.track_ids[matches]
+        new_kf.track_ids[valid] = matched_track_ids[valid]
 
     def register_keyframe(self, new_kf: Keyframe):
         """Add new tracks, update old ones, and add the kf to the kf dict"""
@@ -260,16 +247,17 @@ class SuperFlow(Node):
         self.get_logger().info(
             f"keyframe {new_kf.kf_id} registered, {n_new} new tracks"
         )
+        self.rebuild_kdtree()
 
     def redetect_and_merge(self, img: np.ndarray) -> Keyframe | None:
         if self.latest_odom_msg is None:
             return
 
-        self.get_logger().info("redetecting")
-
         new_pts, new_descs = self.detect_with_superpoint(img)
 
-        new_kf = self.create_keyframe(new_pts=new_pts, new_descs=new_descs)
+        new_kf = self.create_kf(
+            new_pts=new_pts, new_descs=new_descs, img_size=img.shape
+        )
         if new_kf is None:
             return
 
@@ -281,6 +269,30 @@ class SuperFlow(Node):
         self.get_logger().info(f"kfs: {len(self.kfs)}")
 
         return new_kf
+
+    def check_loop_closure(self, new_kf: Keyframe):
+        candidates = self.get_loop_closure_candidates(new_kf)
+
+    def get_loop_closure_candidates(self, new_kf: Keyframe) -> list[Keyframe]:
+        closest = self.get_closest_keyframes(new_kf.position, k=self.min_kfs)
+        candidates = []
+
+        for kf in closest:
+            if abs(kf.kf_id - new_kf.kf_id) < 2:  # hmm
+                continue
+            dot = np.abs(np.dot(new_kf.q, kf.q))
+            if dot > 0.9:
+                candidates.append(kf)
+
+        return candidates
+
+    def get_closest_keyframes(self, position: np.ndarray, k: int = 5) -> list[Keyframe]:
+        if self.kdtree is None or len(self.kfs) < k:
+            return []
+
+        _, indices = self.kdtree.query(position, k=k)
+        kf_ids = list(self.kfs.keys())
+        return [self.kfs[kf_ids[i]] for i in indices]
 
     def init_reference(self, lat_0, lon_0, alt_0):
         self.ref_alt = alt_0
@@ -341,7 +353,9 @@ class SuperFlow(Node):
             return
 
         # ravel is like flatten, but tries to return a view and not a copy
-        good_mask = status.ravel() == 1  # == 1 to create boolean mask
+        good_mask = np.array(
+            status.ravel() == 1, dtype=bool
+        )  # == 1 to create boolean mask
         pts1 = curr_pts[good_mask].reshape(-1, 2)
         if pts1.shape[0] == 0:
             self.prev_pts = None
@@ -354,13 +368,36 @@ class SuperFlow(Node):
         track_ids = (
             self.prev_track_ids[good_mask] if self.prev_track_ids is not None else None
         )
+
         try:
             if track_ids is not None:
                 self.track_counts[track_ids] += 1
         except IndexError:
             breakpoint()
 
-        self.update_mask(pretty_img, pts1, pts0, log=True)
+        output = self.draw_mask(pretty_img, pts1, pts0, track_ids)
+        last_kf = self.get_latest_keyframe()
+        if (
+            last_kf is not None
+            and track_ids is not None
+            and self.should_add_kf(last_kf)
+        ):
+            mask, descs = last_kf.get_descs_for_tracks(track_ids)
+            new_kf = self.create_kf(
+                new_pts=pts1[mask],
+                new_descs=descs,
+                img_size=gray.shape,
+                track_ids=track_ids[mask],
+            )
+            if new_kf is not None:
+                self.add_kf(new_kf)
+                self.log_kf_img(
+                    output,
+                    pts1,
+                    pts0,
+                    track_ids,
+                    new_kf.kf_id,
+                )
 
         self.prev_pts = pts1
         self.prev_gray = gray
@@ -368,13 +405,30 @@ class SuperFlow(Node):
 
         # TODO: log the points
 
-    def update_mask(
+    def add_kf(self, kf: Keyframe | None):
+        if kf is None:
+            return
+
+        self.kfs[kf.kf_id] = kf
+        self.rebuild_kdtree()
+
+    def publish_kf(self, kf: Keyframe):
+        self._keyframe_pub.publish(kf.to_ros_msg(clock=self.get_clock()))
+
+    def should_add_kf(self, last_kf: Keyframe) -> bool:
+        if self.latest_odom_msg is not None:
+            if last_kf.is_close(self.latest_odom_msg.position, self.latest_odom_msg.q):
+                return False
+        return True
+
+    def draw_mask(
         self,
         img: np.ndarray,
         pts1: np.ndarray,
         pts0: np.ndarray,
+        track_ids: np.ndarray,
         *,
-        log: bool = False,
+        log: bool = True,
     ):
         if self.mask is None:
             self.mask = np.zeros(img.shape, dtype=np.uint8)
@@ -386,25 +440,23 @@ class SuperFlow(Node):
             c, d = old.ravel().astype(int)
             cv2.line(self.mask, (a, b), (c, d), (0, 255, 0), 2)
 
+        output = cv2.add(img, self.mask)
+        self.draw_track_ids(output, pts1, track_ids)
         if log:
-            output = cv2.add(img, self.mask)
-            rr.log("matches", rr.Image(output), static=True)
+            rr.log("world/camera/flow", rr.Image(output), static=True)
 
-    def log_matches(self, key: str, img: np.ndarray, kps: np.ndarray):
-        pretty = img.copy()
-        for kp in kps:
-            pretty = cv2.circle(
-                img=pretty,
-                center=kp.astype(int),
-                radius=1,
-                color=(0, 255, 0),
-                thickness=1,
-            )
+        return output
 
-        rr.log(key, rr.Image(pretty), static=True)
-
-    def pose_callback(self, msg: PoseStamped):
-        self.latest_pose = msg
+    def log_kf_img(
+        self,
+        img: np.ndarray,
+        pts1: np.ndarray,
+        pts0: np.ndarray,
+        track_ids: np.ndarray,
+        kf_id: int,
+    ):
+        pretty = self.draw_mask(img, pts1, pts0, track_ids, log=False)
+        rr.log(f"world/camera/keyframes/{kf_id}/pinhole", rr.Image(pretty))
 
     def odometry_callback(self, msg: VehicleOdometry):
         self.latest_odom_msg = msg
