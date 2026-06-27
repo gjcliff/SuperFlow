@@ -15,7 +15,7 @@ from rclpy.qos import qos_profile_sensor_data
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import CameraInfo, Image
 
-from px4_slam.data import IDGenerator, Keyframe, Track
+from px4_slam.data import IDGenerator, Keyframe
 
 torch.set_grad_enabled(False)
 torch.set_float32_matmul_precision("high")
@@ -110,6 +110,7 @@ class SuperFlow(Node):
         # track state
         self.prev_gray: np.ndarray | None = None
         self.prev_pts: np.ndarray | None = None  # this will go
+        self.prev_track_ids: np.ndarray | None = None
         self.mask: np.ndarray | None = None  # = np.zeros(img_shape, dtype=np.uint8)
         self.track_ids: list[int] = []
         self.track_lengths: dict[int, int] = {}
@@ -124,7 +125,6 @@ class SuperFlow(Node):
         self.kp_match_thresh: float = 0.8
 
         self.kfs: dict[int, Keyframe] = {}
-        self.tracks: dict[int, Track] = {}
         self.max_tracks = 50_000
         self.track_counts: np.ndarray = np.empty(0, dtype=np.uint32)
         self.min_kfs: int = min_kfs
@@ -174,7 +174,7 @@ class SuperFlow(Node):
         kps = feats["keypoints"][0].cpu().numpy()  # (n, 2)
         desc = feats["descriptors"][0].cpu().numpy()  # (n, 256)
 
-        return kps.reshape(-1, 1, 2).astype(np.float32), desc
+        return kps.reshape(-1, 2).astype(np.float32), desc
 
     def draw_track_ids(
         self, img: np.ndarray, pts: np.ndarray, track_ids: list[int]
@@ -196,14 +196,15 @@ class SuperFlow(Node):
             return None
 
         # tracks handle creating and incrementing their own ids
-        new_ids = IDGenerator.next_batch(new_pts.shape[0])
 
         q = self.latest_odom_msg.q
         # keyframes also handle creating and incrementing their own ids
         kf = Keyframe(
             kps=new_pts,
             desc=new_descs,
-            track_ids=new_ids,  # these will be replaced by matches' ids
+            track_ids=np.zeros(
+                new_pts.shape[0], dtype=np.uint32
+            ),  # these will be replaced by matches' ids
             position=self.latest_odom_msg.position,
             q=self.latest_odom_msg.q,
             rot=Rotation(quat=[q[1], q[2], q[3], q[0]]).as_matrix(),
@@ -244,14 +245,16 @@ class SuperFlow(Node):
         # a track's track_id is its index in track_counts
         # if a track_id is a larger number than the length of track_counts, that must
         # mean that it's a new id
-        brand_new_ids = new_kf.track_ids >= len(self.track_counts)
+        existing_ids = new_kf.track_ids > 0
+        brand_new_ids = ~existing_ids
         n_new = brand_new_ids.sum()
+        new_ids = IDGenerator.next_batch(n=n_new)
+        new_kf.track_ids[brand_new_ids] = new_ids
 
         self.track_counts = np.concat(
             [self.track_counts, np.ones(n_new, dtype=np.uint32)]
         )
 
-        existing_ids = ~brand_new_ids
         self.track_counts[new_kf.track_ids[existing_ids]] += 1
         self.kfs[new_kf.kf_id] = new_kf
         self.get_logger().info(
@@ -261,6 +264,8 @@ class SuperFlow(Node):
     def redetect_and_merge(self, img: np.ndarray) -> Keyframe | None:
         if self.latest_odom_msg is None:
             return
+
+        self.get_logger().info("redetecting")
 
         new_pts, new_descs = self.detect_with_superpoint(img)
 
@@ -312,6 +317,7 @@ class SuperFlow(Node):
         if self.prev_pts is None or self.prev_pts.shape[0] < 30:
             kf = self.redetect_and_merge(gray)
             self.prev_pts = kf.kps if kf else None
+            self.prev_track_ids = kf.track_ids if kf else None
             self.prev_gray = gray
             return
 
@@ -338,18 +344,27 @@ class SuperFlow(Node):
         good_mask = status.ravel() == 1  # == 1 to create boolean mask
         pts1 = curr_pts[good_mask].reshape(-1, 2)
         if pts1.shape[0] == 0:
-            self.prev_pts = pts1
+            self.prev_pts = None
             self.prev_gray = gray
             return
 
         # self.log_matches("matches", img, pts1)
 
         pts0 = self.prev_pts[good_mask]
+        track_ids = (
+            self.prev_track_ids[good_mask] if self.prev_track_ids is not None else None
+        )
+        try:
+            if track_ids is not None:
+                self.track_counts[track_ids] += 1
+        except IndexError:
+            breakpoint()
 
         self.update_mask(pretty_img, pts1, pts0, log=True)
 
         self.prev_pts = pts1
         self.prev_gray = gray
+        self.prev_track_ids = track_ids
 
         # TODO: log the points
 
@@ -373,7 +388,7 @@ class SuperFlow(Node):
 
         if log:
             output = cv2.add(img, self.mask)
-            rr.log("matches", rr.Image(output))
+            rr.log("matches", rr.Image(output), static=True)
 
     def log_matches(self, key: str, img: np.ndarray, kps: np.ndarray):
         pretty = img.copy()
