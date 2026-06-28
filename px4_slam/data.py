@@ -45,9 +45,6 @@ class Keyframe:
         idx = sorter[np.searchsorted(self.track_ids, track_ids[mask], sorter=sorter)]
         return mask, self.desc[idx]
 
-    def log_keyframe_img(self, img: np.ndarray):
-        rr.log(f"keyframes/{self.kf_id}/img", rr.Image(img), static=True)
-
     def log_keyframe_txt(self):
         rr.log(
             f"keyframes/{self.kf_id}/kps/length",

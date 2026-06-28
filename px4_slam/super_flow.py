@@ -2,6 +2,7 @@ import time
 from typing import Any, cast
 
 import cv2
+import gtsam
 import numpy as np
 import rclpy
 import rerun as rr
@@ -12,12 +13,34 @@ from px4_slam_interfaces.msg import Keyframe as KeyframeMsg
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from scipy.spatial import KDTree
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 
 from px4_slam.data import IDGenerator, Keyframe
 
 torch.set_grad_enabled(False)
 torch.set_float32_matmul_precision("high")
+
+
+class State:
+    def __init__(self):
+        self.prev_pts: np.ndarray | None = None  # this will go
+        self.prev_gray: np.ndarray | None = None
+        self.prev_track_ids: np.ndarray | None = None
+        self.mask: np.ndarray | None = None  # = np.zeros(img_shape, dtype=np.uint8)
+
+    def reset(self):
+        self.prev_pts = None
+        self.prev_gray = None
+        self.prev_track_ids = None
+
+    def update(self, pts, gray, track_ids):
+        self.prev_pts = pts
+        self.prev_gray = gray
+        self.prev_track_ids = track_ids
+
+    @property
+    def needs_redetect(self) -> bool:
+        return self.prev_pts is None or self.prev_pts.shape[0] < 30
 
 
 class SuperFlow(Node):
@@ -45,6 +68,12 @@ class SuperFlow(Node):
             VehicleOdometry,
             "fmu/out/vehicle_odometry",
             self.odometry_callback,
+            qos_profile=qos_profile_sensor_data,
+        )
+        self._camera_info_sub = self.create_subscription(
+            CameraInfo,
+            "camera/camera_info",
+            self.camera_info_callback,
             qos_profile=qos_profile_sensor_data,
         )
         # self._gps_sub: rclpy.node.Subscription = self.create_subscription(
@@ -79,15 +108,22 @@ class SuperFlow(Node):
         self.max_tracks = 50_000
 
         # track state
-        self.prev_gray: np.ndarray | None = None
-        self.prev_pts: np.ndarray | None = None  # this will go
-        self.prev_track_ids: np.ndarray | None = None
-        self.mask: np.ndarray | None = None  # = np.zeros(img_shape, dtype=np.uint8)
+        self.state = State()
 
         self.kfs: dict[int, Keyframe] = {}
         self.kdtree: KDTree | None = None
         self.track_counts: np.ndarray = np.empty(0, dtype=np.uint32)
         self.min_kfs: int = min_kfs
+
+        self.K: gtsam.Cal3_S2 | None = None
+        self.body_T_cam = np.array(
+            [
+                [0, 0, 1, 0.12],
+                [1, 0, 0, 0.03],
+                [0, 1, 0, 0.242],
+                [0, 0, 0, 1],
+            ]
+        )
 
         self.latest_odom_msg: VehicleOdometry | None = None
         self.latest_gps_msg: SensorGps | None = None
@@ -167,8 +203,6 @@ class SuperFlow(Node):
         img_size: tuple[int, int],
         track_ids: np.ndarray | None = None,
     ) -> Keyframe | None:
-        # am i cheating?
-        # this could also come from gps and attitude
         if self.latest_odom_msg is None:
             return None
 
@@ -192,8 +226,6 @@ class SuperFlow(Node):
         self.get_logger().info(
             f"new kf with {kf.kps.shape} points, {kf.desc.shape} desc, {kf.track_ids.shape} tracks"
         )
-
-        self.publish_kf(kf)
 
         return kf
 
@@ -223,7 +255,7 @@ class SuperFlow(Node):
 
         best_scores = scores[np.arange(len(matches)), matches]
         valid = best_scores > self.kp_match_thresh
-        self.get_logger().debug(f"num valid: {len(valid)}")
+        self.get_logger().info(f"num valid: {len(valid)}")
         matched_track_ids = kf.track_ids[matches]
         new_kf.track_ids[valid] = matched_track_ids[valid]
 
@@ -247,6 +279,7 @@ class SuperFlow(Node):
         self.get_logger().info(
             f"keyframe {new_kf.kf_id} registered, {n_new} new tracks"
         )
+        self.publish_kf(new_kf)
         self.rebuild_kdtree()
 
     def redetect_and_merge(self, img: np.ndarray) -> Keyframe | None:
@@ -260,9 +293,6 @@ class SuperFlow(Node):
         )
         if new_kf is None:
             return
-
-        if new_kf.log:
-            new_kf.log_keyframe_img(img)
 
         self.associate_tracks(new_kf)
         self.register_keyframe(new_kf)
@@ -322,25 +352,28 @@ class SuperFlow(Node):
         east = k * cos_lat * np.sin(lon_rad - self.ref_lon) * 6371000
         return north, east
 
+    def increment_track_ids(self, track_ids: np.ndarray):
+        self.track_counts[track_ids] += 1
+
     def image_callback(self, msg: Image):
         gray = self.ros_image_to_gray(msg)
+        pretty_img = self.ros_image_to_rgb(msg)
 
         # redetect with superpoint periodically or on first frame
-        if self.prev_pts is None or self.prev_pts.shape[0] < 30:
+        if self.state.prev_pts is None or self.state.prev_pts.shape[0] < 100:
             kf = self.redetect_and_merge(gray)
-            self.prev_pts = kf.kps if kf else None
-            self.prev_track_ids = kf.track_ids if kf else None
-            self.prev_gray = gray
+            if kf is None:
+                return
+            self.log_kf(kf, pretty_img)
+            self.state.update(pts=kf.kps, gray=gray, track_ids=kf.track_ids)
             return
-
-        pretty_img = self.ros_image_to_rgb(msg)
 
         # track with lk optical flow
         # had an ai help me with type casting because i like knowing types
         result = cast(
             tuple[np.ndarray, np.ndarray, np.ndarray] | None,
             cv2.calcOpticalFlowPyrLK(  # ty: ignore
-                self.prev_gray, gray, self.prev_pts, None, **self.lk_params
+                self.state.prev_gray, gray, self.state.prev_pts, None, **self.lk_params
             ),
         )
         curr_pts: np.ndarray | None = result[0] if result is not None else None
@@ -349,7 +382,8 @@ class SuperFlow(Node):
 
         if curr_pts is None or status is None:
             self.get_logger().warn("optical flow failed, triggering redetection")
-            self.prev_pts = None  # force redetection next frame
+            self.state.reset()
+            # self.prev_pts = None  # force redetection next frame
             return
 
         # ravel is like flatten, but tries to return a view and not a copy
@@ -358,24 +392,29 @@ class SuperFlow(Node):
         )  # == 1 to create boolean mask
         pts1 = curr_pts[good_mask].reshape(-1, 2)
         if pts1.shape[0] == 0:
-            self.prev_pts = None
-            self.prev_gray = gray
+            self.state.reset()
+            # self.prev_pts = None
+            # self.prev_gray = gray
             return
 
         # self.log_matches("matches", img, pts1)
 
-        pts0 = self.prev_pts[good_mask]
-        track_ids = (
-            self.prev_track_ids[good_mask] if self.prev_track_ids is not None else None
+        pts0 = self.state.prev_pts[good_mask]
+        track_ids = cast(
+            np.ndarray,
+            self.state.prev_track_ids[good_mask]
+            if self.state.prev_track_ids is not None
+            else None,
         )
 
         try:
             if track_ids is not None:
+                self.increment_track_ids(track_ids)
                 self.track_counts[track_ids] += 1
         except IndexError:
             breakpoint()
 
-        output = self.draw_mask(pretty_img, pts1, pts0, track_ids)
+        pretty = self.draw_mask(pretty_img, pts1, pts0, track_ids)
         last_kf = self.get_latest_keyframe()
         if (
             last_kf is not None
@@ -391,17 +430,16 @@ class SuperFlow(Node):
             )
             if new_kf is not None:
                 self.add_kf(new_kf)
-                self.log_kf_img(
-                    output,
-                    pts1,
-                    pts0,
-                    track_ids,
-                    new_kf.kf_id,
+                self.publish_kf(new_kf)
+                self.log_kf(
+                    new_kf,
+                    pretty,
                 )
 
-        self.prev_pts = pts1
-        self.prev_gray = gray
-        self.prev_track_ids = track_ids
+        self.state.update(pts=pts1, gray=gray, track_ids=track_ids)
+        # self.prev_pts = pts1
+        # self.prev_gray = gray
+        # self.prev_track_ids = track_ids
 
         # TODO: log the points
 
@@ -416,6 +454,7 @@ class SuperFlow(Node):
         self._keyframe_pub.publish(kf.to_ros_msg(clock=self.get_clock()))
 
     def should_add_kf(self, last_kf: Keyframe) -> bool:
+        return False
         if self.latest_odom_msg is not None:
             if last_kf.is_close(self.latest_odom_msg.position, self.latest_odom_msg.q):
                 return False
@@ -430,39 +469,92 @@ class SuperFlow(Node):
         *,
         log: bool = True,
     ):
-        if self.mask is None:
-            self.mask = np.zeros(img.shape, dtype=np.uint8)
+        if self.state.mask is None:
+            self.state.mask = np.zeros(img.shape, dtype=np.uint8)
 
-        self.mask = (self.mask * 0.95).astype(np.uint8)
+        self.state.mask = (self.state.mask * 0.95).astype(np.uint8)
 
         for new, old in zip(pts1, pts0):
             a, b = new.ravel().astype(int)
             c, d = old.ravel().astype(int)
-            cv2.line(self.mask, (a, b), (c, d), (0, 255, 0), 2)
+            cv2.line(self.state.mask, (a, b), (c, d), (0, 255, 0), 2)
 
-        output = cv2.add(img, self.mask)
+        output = cv2.add(img, self.state.mask)
         self.draw_track_ids(output, pts1, track_ids)
         if log:
-            rr.log("world/camera/flow", rr.Image(output), static=True)
+            rr.log("flow", rr.Image(output), static=True)
 
         return output
 
-    def log_kf_img(
-        self,
-        img: np.ndarray,
-        pts1: np.ndarray,
-        pts0: np.ndarray,
-        track_ids: np.ndarray,
-        kf_id: int,
-    ):
-        pretty = self.draw_mask(img, pts1, pts0, track_ids, log=False)
-        rr.log(f"world/camera/keyframes/{kf_id}/pinhole", rr.Image(pretty))
+    def log_kf(self, kf, img):
+        if self.K is None:
+            return
+
+        q = kf.q  # [w, x, y, z]
+        world_R_body = gtsam.Rot3.Quaternion(q[0], q[1], q[2], q[3])
+        world_t_body = gtsam.Point3(*kf.position)
+        world_T_body = gtsam.Pose3(world_R_body, world_t_body)
+
+        world_T_cam = world_T_body.compose(gtsam.Pose3(self.body_T_cam))
+
+        t = world_T_cam.translation()
+        q_cam = (
+            world_T_cam.rotation().toQuaternion()
+        )  # gtsam quaternion is [w, x, y, z]
+
+        rr.log(
+            f"world/camera/keyframes/{kf.kf_id}",
+            rr.Transform3D(
+                translation=np.array([t[0], t[1], t[2]]),
+                rotation=rr.Quaternion(
+                    xyzw=[q_cam.x(), q_cam.y(), q_cam.z(), q_cam.w()]
+                ),
+            ),
+        )
+        rr.log(
+            f"world/camera/keyframes/{kf.kf_id}/pinhole",
+            rr.Pinhole(
+                focal_length=(self.K.fx(), self.K.fy()),
+                principal_point=(self.K.px(), self.K.py()),
+                width=kf.img_size[1],
+                height=kf.img_size[0],
+                camera_xyz=rr.ViewCoordinates.RDF,
+            ),
+        )
+        pretty = img.copy()
+        for pt, tid in zip(kf.kps, kf.track_ids):
+            x, y = (int(pt[0]), int(pt[1]))
+            count = self.track_counts[tid]
+            cv2.putText(
+                pretty,
+                f"{tid}, {count}",
+                (x, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.3,
+                (0, 255, 0),
+                1,
+            )
+            cv2.circle(pretty, (x, y), radius=3, color=(0, 255, 0), thickness=2)
+        rr.log(f"world/camera/keyframes/{kf.kf_id}/pinhole/image", rr.Image(pretty))
 
     def odometry_callback(self, msg: VehicleOdometry):
         self.latest_odom_msg = msg
 
     def gps_callback(self, msg: SensorGps):
         self.latest_gps_msg = msg
+
+    # [fx,  s, cx]     k[0], k[1], k[2]
+    # [ 0, fy, cy]  =  k[3], k[4], k[5]
+    # [ 0,  0,  1]     k[6], k[7], k[8]
+    def camera_info_callback(self, msg: CameraInfo):
+        if self.K is None:
+            self.K = gtsam.Cal3_S2(
+                msg.k[0],  # fx
+                msg.k[4],  # fy
+                msg.k[1],  # s (skew)
+                msg.k[2],  # cx
+                msg.k[5],  # cy
+            )
 
 
 def main(args=None):

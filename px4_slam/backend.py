@@ -132,7 +132,7 @@ class Backend(Node):
     def keyframe_callback(self, msg: KeyframeMsg):
         self.get_logger().info("got kf")
         kf = Keyframe.from_ros_msg(msg)
-        self.log_kf_pinhole(kf)
+        # self.log_kf_pinhole(kf)
 
     def log_kf_pinhole(self, kf: Keyframe):
         if self.K is None:
@@ -189,6 +189,9 @@ class Backend(Node):
             static=True,
         )
 
+    # [fx,  s, cx]     k[0], k[1], k[2]
+    # [ 0, fy, cy]  =  k[3], k[4], k[5]
+    # [ 0,  0,  1]     k[6], k[7], k[8]
     def camera_info_callback(self, msg: CameraInfo):
         if self.K is None:
             self.K = gtsam.Cal3_S2(
