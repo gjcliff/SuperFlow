@@ -1,11 +1,12 @@
 import time
+from typing import cast
 
 import gtsam
 import numpy as np
 import rclpy
 import rerun as rr
 from geometry_msgs.msg import PoseStamped
-from gtsam.symbol_shorthand import V, X
+from gtsam.gtsam.symbol_shorthand import V, X
 from px4_msgs.msg import VehicleOdometry
 from px4_slam_interfaces.msg import Keyframe as KeyframeMsg
 from rclpy.node import Node
@@ -13,6 +14,23 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo
 
 from px4_slam.data import Keyframe
+
+
+class BackendState:
+    def __init__(self):
+        self.prev_kf: Keyframe | None = None
+        self.smart_factors: dict[int, gtsam.SmartProjectionPoseFactorCal3_S2] = {}
+
+    def reset(self):
+        self.prev_kf = None
+        self.smart_factors.clear()
+
+    def update(self, kf: Keyframe):
+        self.prev_kf = kf
+
+    # @property
+    # def needs_redetect(self) -> bool:
+    #     return self.prev_pts is None or self.prev_pts.shape[0] < 100
 
 
 class Backend(Node):
@@ -51,9 +69,11 @@ class Backend(Node):
             PoseStamped, "state_estimate/pose", qos_profile_sensor_data
         )
 
-        self.initialized: bool = False
         self.count: int = 0
         self.prev_imu_timestamp: int | None = None
+
+        self.state = BackendState()
+        self.prev_kf: Keyframe | None = None
 
         self.latest_odom_msg: VehicleOdometry | None = None
         self.isam: gtsam.ISAM2
@@ -95,7 +115,6 @@ class Backend(Node):
         init_values = gtsam.Values()
         init_graph, init_values = self.set_priors(graph=init_graph, values=init_values)
         self.isam.update(init_graph, init_values)
-        self.initialized = True
 
     def set_priors(
         self, graph: gtsam.NonlinearFactorGraph, values: gtsam.Values
@@ -130,9 +149,89 @@ class Backend(Node):
         )
 
     def keyframe_callback(self, msg: KeyframeMsg):
-        self.get_logger().info("got kf")
+        if self.K is None:
+            return
         kf = Keyframe.from_ros_msg(msg)
-        # self.log_kf_pinhole(kf)
+
+        graph = gtsam.NonlinearFactorGraph()
+        values = gtsam.Values()
+
+        pose_key = X(kf.kf_id)
+        # kf_key = K(kf.kf_id)
+
+        world_T_body = gtsam.Pose3(
+            gtsam.Rot3.Quaternion(*kf.q),
+            gtsam.Point3(*kf.position),
+        )
+        values.insert(pose_key, world_T_body)
+
+        if self.state.prev_kf is None:
+            self.state.update(kf)
+            prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
+                np.array([0.01, 0.01, 0.01, 0.1, 0.1, 0.1])
+            )
+            graph.add(gtsam.PriorFactorPose3(pose_key, world_T_body, prior_noise))
+            self.isam.update(graph, values)
+            return
+
+
+        prev_pose_key = X(self.state.prev_kf.kf_id)
+        prev_T_world = gtsam.Pose3(
+            gtsam.Rot3.Quaternion(*self.state.prev_kf.q),
+            gtsam.Point3(*self.state.prev_kf.position),
+        )
+
+        relative_pose = prev_T_world.inverse().compose(world_T_body)
+        odom_noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([0.1, 0.1, 0.1, 0.3, 0.3, 0.3])
+        )
+        graph.add(
+            gtsam.BetweenFactorPose3(
+                prev_pose_key,
+                pose_key,
+                relative_pose,
+                odom_noise,
+            )
+        )
+
+        for i, track_id in enumerate(kf.track_ids):
+            pt = kf.kps[i]
+            measurement = gtsam.Point2(pt[0], pt[1])
+
+            if track_id not in self.state.smart_factors:
+                self.state.smart_factors[track_id] = (
+                    gtsam.SmartProjectionPoseFactorCal3_S2(
+                        self.pixel_noise, self.K, self.body_P_cam, self.smart_params
+                    )
+                )
+                graph.push_back(self.state.smart_factors[track_id])
+
+            try:
+                self.state.smart_factors[track_id].add(measurement, pose_key)
+            except ValueError:
+                breakpoint()
+
+        self.isam.update(graph, values)
+        self.state.update(kf)
+
+        result = cast(gtsam.Values, self.isam.calculateEstimate())
+        optimized_pose = result.atPose3(pose_key)
+        self.log_pose(optimized_pose)
+
+        points = []
+        for factor in self.state.smart_factors.values():
+            point = factor.point(result)
+            if point is not None:
+                points.append(np.array(point))
+        if points:
+            rr.log(
+                "world/landmarks",
+                rr.Points3D(
+                    np.array(points),
+                    colors=[[0, 255, 255]] * len(points),
+                    radii=0.05,
+                ),
+            )
 
     def log_kf_pinhole(self, kf: Keyframe):
         if self.K is None:
@@ -201,6 +300,10 @@ class Backend(Node):
                 msg.k[2],  # cx
                 msg.k[5],  # cy
             )
+
+            if self._camera_info_sub is not None:
+                self.destroy_subscription(self._camera_info_sub)
+                self._camera_info_sub = None
 
 
 def main(args=None):

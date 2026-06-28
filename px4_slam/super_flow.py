@@ -23,7 +23,7 @@ torch.set_grad_enabled(False)
 torch.set_float32_matmul_precision("high")
 
 
-class State:
+class SuperFlowState:
     def __init__(self):
         self.prev_pts: np.ndarray | None = None  # this will go
         self.prev_gray: np.ndarray | None = None
@@ -42,7 +42,7 @@ class State:
 
     @property
     def needs_redetect(self) -> bool:
-        return self.prev_pts is None or self.prev_pts.shape[0] < 30
+        return self.prev_pts is None or self.prev_pts.shape[0] < 100
 
 
 class SuperFlow(Node):
@@ -115,12 +115,12 @@ class SuperFlow(Node):
         self.max_tracks = 50_000
 
         # track state
-        self.state = State()
+        self.state = SuperFlowState()
 
         self.kfs: dict[int, Keyframe] = {}
         self.lcs: dict[int, LoopClosure]
         self.kdtree: KDTree | None = None
-        self.track_counts: np.ndarray = np.empty(0, dtype=np.uint32)
+        self.track_counts: np.ndarray = np.empty(1, dtype=np.uint32)
         self.min_kfs: int = min_kfs
         self.min_loop_closure_matches = 50
         self.lc_done = False
@@ -252,30 +252,36 @@ class SuperFlow(Node):
         return None
 
     def associate_tracks(self, new_kf: Keyframe):
-        """Update track_ids in the new kf if they already exist
-
-        this is mainly a front-end only function, we just want it to track points from
-        one kf to another. loop closure if for older kfs
-        """
         kf = self.get_latest_keyframe()
         if kf is None:
             return
-        scores = new_kf.desc @ kf.desc.T
+        scores = new_kf.desc @ kf.desc.T  # (n_new, n_old)
         matches = np.argmax(scores, axis=1)
-
         best_scores = scores[np.arange(len(matches)), matches]
         valid = best_scores > self.kp_match_thresh
-        matched_track_ids = kf.track_ids[matches]
-        new_kf.track_ids[valid] = matched_track_ids[valid]
+
+        # for each old track, only keep the new point with the highest score
+        valid_indices = np.where(valid)[0]
+
+        # among duplicates keep the highest scoring one
+        final_mask = np.zeros(len(new_kf.track_ids), dtype=bool)
+        assigned_old = {}
+        for idx in valid_indices[np.argsort(-best_scores[valid])]:
+            old_id = matches[idx]
+            if old_id not in assigned_old:
+                assigned_old[old_id] = idx
+                final_mask[idx] = True
+
+        new_kf.track_ids[final_mask] = kf.track_ids[matches[final_mask]]
 
     def register_keyframe(self, new_kf: Keyframe):
         """Add new tracks, update old ones, and add the kf to the kf dict"""
         # a track's track_id is its index in track_counts
         # if a track_id is a larger number than the length of track_counts, that must
         # mean that it's a new id
-        existing_ids = new_kf.track_ids > 0
-        brand_new_ids = ~existing_ids
-        n_new = brand_new_ids.sum()
+        brand_new_ids = new_kf.track_ids == 0
+        existing_ids = ~brand_new_ids
+        n_new = int(brand_new_ids.sum())
         new_ids = IDGenerator.next_batch(n=n_new)
         new_kf.track_ids[brand_new_ids] = new_ids
 
@@ -305,6 +311,9 @@ class SuperFlow(Node):
 
         self.associate_tracks(new_kf)
         self.register_keyframe(new_kf)
+
+        if len(np.unique(new_kf.track_ids)) != len(new_kf.track_ids):
+            breakpoint()
         self.check_loop_closure(new_kf)
 
         return new_kf
@@ -326,7 +335,7 @@ class SuperFlow(Node):
             matches = np.argmax(scores, axis=1)
             best_scores = scores[np.arange(len(matches)), matches]
             valid = best_scores > self.kp_match_thresh
-            if (n_valid:=int(valid.sum())) < self.min_loop_closure_matches:
+            if (n_valid := int(valid.sum())) < self.min_loop_closure_matches:
                 continue
 
             lg.log_loop_closure(new_kf, kf, n_valid)
@@ -419,7 +428,7 @@ class SuperFlow(Node):
         pretty_img = self.ros_image_to_rgb(msg)
 
         # redetect with superpoint periodically or on first frame
-        if self.state.prev_pts is None or self.state.prev_pts.shape[0] < 100:
+        if self.state.needs_redetect:
             kf = self.redetect_and_merge(gray)
             if kf is None:
                 return

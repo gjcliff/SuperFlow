@@ -156,7 +156,7 @@ class Keyframe:
 
 
 class IDGenerator:
-    _next_id = 0
+    _next_id = 1
 
     @classmethod
     def next(cls) -> int:

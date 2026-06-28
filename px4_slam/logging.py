@@ -71,7 +71,7 @@ def log_kf(
     pretty = img.copy()
     for pt, tid in zip(kf.kps, kf.track_ids):
         x, y = (int(pt[0]), int(pt[1]))
-        count = track_counts[tid]
+        count = track_counts[tid-1]
         cv2.putText(
             pretty,
             f"{tid}, {count}",
