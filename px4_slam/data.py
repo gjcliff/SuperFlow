@@ -5,6 +5,37 @@ import numpy as np
 import rclpy.clock
 import rerun as rr
 from px4_slam_interfaces.msg import Keyframe as KeyframeMsg
+from px4_slam_interfaces.msg import LoopClosure as LoopClosureMsg
+
+
+@dataclass
+class LoopClosure:
+    query_kf_id: int
+    match_kf_id: int
+    rel_pos: np.ndarray
+    rel_q: np.ndarray
+    n_inliers: int
+
+    def to_ros_msg(self, clock: rclpy.clock.Clock) -> LoopClosureMsg:
+        msg = LoopClosureMsg()
+        msg.header.stamp = clock.now().to_msg()
+        msg.header.frame_id = "world"
+        msg.query_kf_id = self.query_kf_id
+        msg.match_kf_id = self.match_kf_id
+        msg.rel_pos = self.rel_pos
+        msg.rel_q = self.rel_q
+        msg.n_inliers = self.n_inliers
+        return msg
+
+    @classmethod
+    def from_ros_msg(cls, msg: LoopClosureMsg) -> Self:
+        return cls(
+            query_kf_id=msg.query_kf_id,
+            match_kf_id=msg.match_kf_id,
+            rel_pos=msg.rel_pos,
+            rel_q=msg.rel_q,
+            n_inliers=msg.n_inliers,
+        )
 
 
 @dataclass
@@ -104,7 +135,7 @@ class Keyframe:
         msg.position = self.position.astype(np.float32).tolist()
         msg.img_size = self.img_size
         msg.q = self.q.astype(np.float32).tolist()
-        msg.log=self.log
+        msg.log = self.log
 
         return msg
 
