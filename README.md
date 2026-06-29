@@ -60,7 +60,6 @@ python -m venv .venv --system-site-packages
 touch .venv/COLCON_IGNORE
 source .venv/bin/activate
 cd ~/repos/ws/src/px4_slam && \
-    rm -rf build install log && \
     pip install -r requirements.txt && \
     cd ~/repos/ws && \
     colcon build
